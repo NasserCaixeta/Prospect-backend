@@ -1,5 +1,6 @@
 import re
 from dataclasses import asdict, dataclass
+from urllib.parse import quote_plus
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
@@ -54,6 +55,28 @@ def parse_result_card(html: str) -> ScrapedLead:
     )
 
 
+def extract_brazilian_phone(text: str) -> str | None:
+    patterns = (
+        r"\+55\s?\d{2}\s?\d{4,5}-?\d{4}",
+        r"\(\d{2}\)\s?\d{4,5}-\d{4}",
+        r"\b\d{2}\s\d{4,5}-\d{4}\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(0).strip()
+    return None
+
+
+def is_probable_whatsapp_phone(normalized_phone: str | None) -> bool:
+    if not normalized_phone:
+        return False
+    digits = re.sub(r"\D+", "", normalized_phone)
+    if digits.startswith("55") and len(digits) == 13:
+        digits = digits[2:]
+    return len(digits) == 11 and digits[2] == "9"
+
+
 class GoogleMapsScraper:
     blocked_markers = ("captcha", "unusual traffic", "não sou um robô", "nao sou um robo")
 
@@ -63,16 +86,14 @@ class GoogleMapsScraper:
             browser = playwright.chromium.launch(headless=True)
             page = browser.new_page()
             try:
-                page.goto("https://www.google.com/maps", wait_until="domcontentloaded", timeout=30000)
-                page.wait_for_timeout(1000)
+                page.goto(
+                    f"https://www.google.com/maps/search/{quote_plus(query)}",
+                    wait_until="domcontentloaded",
+                    timeout=30000,
+                )
+                page.wait_for_timeout(5000)
                 if self._is_blocked(page.content()):
                     raise ScraperBlockedError("Google Maps blocked automated access")
-                page.get_by_role("combobox").fill(query)
-                page.keyboard.press("Enter")
-                page.wait_for_timeout(3000)
-                if self._is_blocked(page.content()):
-                    raise ScraperBlockedError("Google Maps requested manual verification")
-                # The live DOM is intentionally handled conservatively. Parser coverage stays fixture-based.
                 results: list[dict] = []
                 cards = page.locator('[role="article"]').all()[:max_results]
                 for card in cards:
@@ -81,9 +102,25 @@ class GoogleMapsScraper:
                     page.wait_for_timeout(700)
                     text = card.inner_text(timeout=3000)
                     name = text.splitlines()[0].strip() if text.strip() else None
-                    link = card.locator("a").first.get_attribute("href", timeout=3000)
+                    link_locator = card.locator("a.hfpxzc").first
+                    if link_locator.count() == 0:
+                        link_locator = card.locator('a[href*="/maps/place"]').first
+                    link = link_locator.get_attribute("href", timeout=3000)
                     if name and link:
-                        results.append(ScrapedLead(name=name, google_maps_url=link).to_dict())
+                        lines = [line.strip() for line in text.splitlines() if line.strip()]
+                        rating = self._extract_rating(lines)
+                        category, address = self._extract_category_and_address(lines)
+                        phone = self._read_detail_phone(page, link)
+                        results.append(
+                            ScrapedLead(
+                                name=name,
+                                google_maps_url=link,
+                                phone=phone,
+                                category=category,
+                                address=address,
+                                rating=rating,
+                            ).to_dict()
+                        )
                 return results
             except PlaywrightTimeoutError as exc:
                 raise RuntimeError("Google Maps search timed out") from exc
@@ -93,3 +130,34 @@ class GoogleMapsScraper:
     def _is_blocked(self, html: str) -> bool:
         lowered = html.lower()
         return any(marker in lowered for marker in self.blocked_markers)
+
+    def _extract_rating(self, lines: list[str]) -> float | None:
+        for line in lines[1:4]:
+            if re.fullmatch(r"\d+[,.]\d+", line):
+                return float(line.replace(",", "."))
+        return None
+
+    def _extract_category_and_address(self, lines: list[str]) -> tuple[str | None, str | None]:
+        for line in lines:
+            if "·" in line:
+                parts = [part.strip(" \ue934") for part in line.split("·")]
+                parts = [part for part in parts if part]
+                category = parts[0] if parts else None
+                address = parts[-1] if len(parts) > 1 else None
+                return category, address
+        return None, None
+
+    def _extract_detail_phone(self, detail_text: str) -> str | None:
+        return extract_brazilian_phone(detail_text)
+
+    def _read_detail_phone(self, page, link: str) -> str | None:
+        try:
+            page.goto(link, wait_until="domcontentloaded", timeout=20000)
+            page.wait_for_timeout(2500)
+            if self._is_blocked(page.content()):
+                raise ScraperBlockedError("Google Maps requested manual verification")
+            return self._extract_detail_phone(page.locator("body").inner_text(timeout=5000))
+        except ScraperBlockedError:
+            raise
+        except Exception:
+            return None

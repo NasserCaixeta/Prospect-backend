@@ -124,6 +124,12 @@ def run_search_job(db: Session, job_id: int, scraper: Scraper | None = None) -> 
                 job.status = SearchJobStatus.CANCELED
                 break
             try:
+                item = {
+                    "city": job.city,
+                    "state": job.state,
+                    "segment": job.segment,
+                    **item,
+                }
                 lead, action = upsert_scraped_lead(db, item)
                 record_job_result(
                     db,

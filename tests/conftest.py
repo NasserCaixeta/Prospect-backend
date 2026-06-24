@@ -10,6 +10,7 @@ from app.db.base import Base
 from app.db.session import get_db
 from app.main import create_app
 from app.models.enums import UserRole
+from app.services.search_jobs import EmptyScraper
 from app.services.users import create_user
 
 
@@ -33,11 +34,13 @@ def db_session() -> Generator[Session, None, None]:
 @pytest.fixture()
 def client(db_session: Session) -> Generator[TestClient, None, None]:
     app = create_app()
+    from app.api.routes.search_jobs import get_scraper
 
     def override_get_db() -> Generator[Session, None, None]:
         yield db_session
 
     app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[get_scraper] = lambda: EmptyScraper()
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.clear()

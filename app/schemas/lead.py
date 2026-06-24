@@ -46,6 +46,7 @@ class LeadRead(BaseModel):
     normalized_name: str
     phone: str | None
     normalized_phone: str | None
+    whatsapp_probable: bool
     city: str | None
     state: str | None
     segment: str | None

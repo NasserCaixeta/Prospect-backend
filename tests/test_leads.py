@@ -98,3 +98,14 @@ def test_upsert_scraped_lead_deduplicates_by_normalized_identity(db_session):
 
     assert action == "updated"
     assert second.id == first.id
+
+
+def test_lead_response_marks_probable_whatsapp(client, admin_headers):
+    response = client.post(
+        "/leads",
+        headers=admin_headers,
+        json={"name": "Lead WhatsApp", "phone": "(19) 99999-9999"},
+    )
+
+    assert response.status_code == 201
+    assert response.json()["whatsapp_probable"] is True

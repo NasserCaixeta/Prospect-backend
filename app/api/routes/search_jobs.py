@@ -1,8 +1,12 @@
-from fastapi import APIRouter, BackgroundTasks, status
+from typing import Annotated
+
+from fastapi import APIRouter, BackgroundTasks, Depends, status
 
 from app.api.deps import CurrentUser, DbSession
 from app.schemas.search_job import SearchJobCreate, SearchJobListResponse, SearchJobRead, SearchJobResultRead
+from app.services.scraper import GoogleMapsScraper
 from app.services.search_jobs import (
+    Scraper,
     cancel_search_job,
     create_search_job,
     get_search_job,
@@ -14,12 +18,17 @@ from app.services.search_jobs import (
 router = APIRouter(prefix="/search-jobs", tags=["search-jobs"])
 
 
+def get_scraper() -> Scraper:
+    return GoogleMapsScraper()
+
+
 @router.post("", response_model=SearchJobRead, status_code=status.HTTP_201_CREATED)
 def create_job_route(
     payload: SearchJobCreate,
     db: DbSession,
     current_user: CurrentUser,
     background_tasks: BackgroundTasks,
+    scraper: Annotated[Scraper, Depends(get_scraper)],
 ) -> SearchJobRead:
     job = create_search_job(
         db,
@@ -32,7 +41,7 @@ def create_job_route(
         include_bad_websites=payload.include_bad_websites,
         created_by_user_id=current_user.id,
     )
-    background_tasks.add_task(run_search_job, db, job.id)
+    background_tasks.add_task(run_search_job, db, job.id, scraper)
     return job
 
 

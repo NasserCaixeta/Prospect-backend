@@ -52,3 +52,12 @@ class Lead(Base):
     assigned_to = relationship("User", back_populates="assigned_leads")
     events = relationship("LeadEvent", back_populates="lead", cascade="all, delete-orphan")
     site_analyses = relationship("SiteAnalysis", back_populates="lead", cascade="all, delete-orphan")
+
+    @property
+    def whatsapp_probable(self) -> bool:
+        if not self.normalized_phone:
+            return False
+        digits = self.normalized_phone
+        if digits.startswith("55") and len(digits) == 13:
+            digits = digits[2:]
+        return len(digits) == 11 and digits[2] == "9"
