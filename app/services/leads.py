@@ -2,6 +2,7 @@ import csv
 import io
 import re
 import unicodedata
+from collections.abc import Callable
 from typing import Any
 
 from fastapi import HTTPException, status
@@ -13,13 +14,18 @@ from app.models.enums import (
     LeadEventType,
     LeadStatus,
     SearchResultAction,
+    SiteAnalysisStatus,
 )
 from app.models.lead import Lead
 from app.models.lead_event import LeadEvent
+from app.models.site_analysis import SiteAnalysis
 from app.models.user import User
 from app.schemas.lead import LeadCreate, LeadUpdate
 from app.schemas.lead_event import LeadEventCreate
 from app.services.scoring import calculate_score
+from app.services.site_analysis import WebsiteAnalysisResult, analyze_website
+
+WebsiteAnalyzer = Callable[[str | None], WebsiteAnalysisResult]
 
 
 def normalize_text(value: str | None) -> str | None:
@@ -52,6 +58,39 @@ def _apply_score(lead: Lead) -> None:
     lead.potential_level = level
 
 
+def _map_site_status_to_digital_presence(site_status: SiteAnalysisStatus) -> DigitalPresence:
+    if site_status == SiteAnalysisStatus.SEM_SITE:
+        return DigitalPresence.SEM_SITE
+    if site_status == SiteAnalysisStatus.SITE_OK:
+        return DigitalPresence.SITE_OK
+    return DigitalPresence.SITE_RUIM
+
+
+def _apply_website_analysis(
+    db: Session,
+    lead: Lead,
+    website_analyzer: WebsiteAnalyzer = analyze_website,
+) -> None:
+    if not lead.website_url:
+        lead.digital_presence = DigitalPresence.SEM_SITE
+        return
+    try:
+        result = website_analyzer(lead.website_url)
+    except Exception:
+        return
+    lead.digital_presence = _map_site_status_to_digital_presence(result.status)
+    db.add(
+        SiteAnalysis(
+            lead=lead,
+            website_url=lead.website_url,
+            status=result.status,
+            score=result.score,
+            issues=result.issues,
+            analysis_data=result.analysis_data,
+        )
+    )
+
+
 def _find_duplicate(db: Session, data: dict[str, Any]) -> Lead | None:
     google_maps_url = data.get("google_maps_url")
     if google_maps_url:
@@ -72,7 +111,11 @@ def _find_duplicate(db: Session, data: dict[str, Any]) -> Lead | None:
     return None
 
 
-def create_manual_lead(db: Session, payload: LeadCreate) -> Lead:
+def create_manual_lead(
+    db: Session,
+    payload: LeadCreate,
+    website_analyzer: WebsiteAnalyzer = analyze_website,
+) -> Lead:
     data = payload.model_dump()
     existing = _find_duplicate(db, data)
     if existing:
@@ -82,8 +125,7 @@ def create_manual_lead(db: Session, payload: LeadCreate) -> Lead:
         normalized_name=normalize_text(payload.name) or payload.name.lower(),
         normalized_phone=normalize_phone(payload.phone),
     )
-    if not lead.website_url:
-        lead.digital_presence = DigitalPresence.SEM_SITE
+    _apply_website_analysis(db, lead, website_analyzer)
     _apply_score(lead)
     db.add(lead)
     db.commit()
@@ -91,7 +133,11 @@ def create_manual_lead(db: Session, payload: LeadCreate) -> Lead:
     return lead
 
 
-def upsert_scraped_lead(db: Session, data: dict[str, Any]) -> tuple[Lead, str]:
+def upsert_scraped_lead(
+    db: Session,
+    data: dict[str, Any],
+    website_analyzer: WebsiteAnalyzer = analyze_website,
+) -> tuple[Lead, str]:
     if not data.get("name") or not data.get("google_maps_url"):
         raise ValueError("Scraped lead requires name and google_maps_url")
     existing = _find_duplicate(db, data)
@@ -112,8 +158,8 @@ def upsert_scraped_lead(db: Session, data: dict[str, Any]) -> tuple[Lead, str]:
             if value and not getattr(existing, field):
                 setattr(existing, field, value)
         existing.normalized_phone = existing.normalized_phone or normalize_phone(existing.phone)
-        if existing.digital_presence == DigitalPresence.SITE_DESCONHECIDO and not existing.website_url:
-            existing.digital_presence = DigitalPresence.SEM_SITE
+        if existing.digital_presence == DigitalPresence.SITE_DESCONHECIDO or "website_url" in data:
+            _apply_website_analysis(db, existing, website_analyzer)
         _apply_score(existing)
         db.commit()
         db.refresh(existing)
@@ -136,6 +182,7 @@ def upsert_scraped_lead(db: Session, data: dict[str, Any]) -> tuple[Lead, str]:
         if data.get("website_url")
         else DigitalPresence.SEM_SITE,
     )
+    _apply_website_analysis(db, lead, website_analyzer)
     _apply_score(lead)
     db.add(lead)
     db.commit()
@@ -181,7 +228,13 @@ def list_leads(
     return items, total
 
 
-def update_lead(db: Session, lead_id: int, payload: LeadUpdate, user: User) -> Lead:
+def update_lead(
+    db: Session,
+    lead_id: int,
+    payload: LeadUpdate,
+    user: User,
+    website_analyzer: WebsiteAnalyzer = analyze_website,
+) -> Lead:
     lead = get_lead(db, lead_id)
     old_status = lead.current_status
     data = payload.model_dump(exclude_unset=True)
@@ -191,6 +244,8 @@ def update_lead(db: Session, lead_id: int, payload: LeadUpdate, user: User) -> L
         lead.normalized_name = normalize_text(lead.name) or lead.name.lower()
     if "phone" in data:
         lead.normalized_phone = normalize_phone(lead.phone)
+    if "website_url" in data:
+        _apply_website_analysis(db, lead, website_analyzer)
     _apply_score(lead)
     if "current_status" in data and lead.current_status != old_status:
         db.add(
